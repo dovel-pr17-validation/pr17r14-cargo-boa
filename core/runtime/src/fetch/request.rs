@@ -1,0 +1,348 @@
+//! The `Request` JavaScript class and adjacent types, implemented as [`JsRequest`].
+//!
+//! See the [Request interface documentation][mdn] for more information.
+//!
+//! [mdn]: https://developer.mozilla.org/en-US/docs/Web/API/Request
+use super::HttpRequest;
+use super::headers::JsHeaders;
+use boa_engine::object::builtins::JsPromise;
+use boa_engine::value::{Convert, TryFromJs};
+use boa_engine::{
+    Context, Finalize, JsData, JsNativeError, JsObject, JsResult, JsString, JsValue, Trace,
+    boa_class, js_error,
+};
+use either::Either;
+use std::mem;
+
+/// A [RequestInit][mdn] object. This is a JavaScript object (not a
+/// class) that can be used as options for creating a [`JsRequest`].
+///
+/// [mdn]: https://developer.mozilla.org/en-US/docs/Web/API/RequestInit
+// TODO: This class does not contain all fields that are defined in the spec.
+#[derive(Debug, Clone, TryFromJs, Trace, Finalize)]
+pub struct RequestInit {
+    body: Option<JsValue>,
+    headers: Option<JsHeaders>,
+    method: Option<Convert<JsString>>,
+    signal: Option<JsObject>,
+}
+
+impl RequestInit {
+    /// Takes the abort signal from the options, if present.
+    pub fn take_signal(&mut self) -> Option<JsObject> {
+        self.signal.take()
+    }
+
+    /// Builds an [`HttpRequest`] from this initializer and an optional input request.
+    ///
+    /// # Errors
+    /// If the body is not a valid type, an error is returned.
+    pub fn into_request_builder(
+        mut self,
+        request: Option<HttpRequest<Option<Vec<u8>>>>,
+    ) -> JsResult<HttpRequest<Option<Vec<u8>>>> {
+        let mut builder = HttpRequest::builder();
+        // https://fetch.spec.whatwg.org/#dom-request - "Let inputBody be input's request's body if input is a Request object; otherwise null."
+        let mut inherited_body = None;
+        if let Some(r) = request {
+            let (parts, body) = r.into_parts();
+            inherited_body = body;
+            builder = builder
+                .method(parts.method)
+                .uri(parts.uri)
+                .version(parts.version);
+
+            for (key, value) in &parts.headers {
+                builder = builder.header(key, value);
+            }
+        }
+
+        if let Some(headers) = self.headers.take() {
+            for (k, v) in headers.as_header_map().borrow().iter() {
+                builder = builder.header(k, v);
+            }
+        }
+
+        if let Some(Convert(ref method)) = self.method.take() {
+            let method = method.to_std_string().map_err(
+                |_| js_error!(TypeError: "Request constructor: {} is an invalid method", method.to_std_string_escaped()),
+            )?;
+            // 25. If init["method"] exists, then:
+            //     1. Let method be init["method"].
+            //     2. If method is not a method or method is a forbidden method, throw a TypeError.
+            //     3. Normalize method.
+            //     4. Set request's method to method.
+            // https://fetch.spec.whatwg.org/#dom-request
+            if method.eq_ignore_ascii_case("CONNECT")
+                || method.eq_ignore_ascii_case("TRACE")
+                || method.eq_ignore_ascii_case("TRACK")
+            {
+                return Err(js_error!(
+                    TypeError: "'{}' HTTP method is unsupported.",
+                    method
+                ));
+            }
+
+            let is_get_or_head_method =
+                method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+
+            // Fetch Standard §5.4 Request constructor:
+            // If either init["body"] exists and is non-null or inputBody is non-null,
+            // and request's method is GET or HEAD, then throw a TypeError.
+            // https://fetch.spec.whatwg.org/#dom-request
+            if is_get_or_head_method && (self.body.is_some() || inherited_body.is_some()) {
+                return Err(js_error!(TypeError: "Request with GET/HEAD method cannot have body."));
+            }
+            builder = builder.method(method.as_str());
+        }
+
+        let request_body = if let Some(body) = &self.body {
+            // TODO: add more support types.
+            if let Some(body) = body.as_string() {
+                let body = body.to_std_string().map_err(
+                    |_| js_error!(TypeError: "Request constructor: body is not a valid string"),
+                )?;
+                Some(body.into_bytes())
+            } else {
+                return Err(
+                    js_error!(TypeError: "Request constructor: body is not a supported type"),
+                );
+            }
+        } else {
+            inherited_body
+        };
+
+        let request = builder
+            .body(request_body)
+            .map_err(|_| js_error!(Error: "Cannot construct request"))?;
+        Ok(request)
+    }
+}
+
+/// The JavaScript `Request` class.
+///
+/// The `Request` interface of the [Fetch API][mdn] represents a resource request.
+///
+/// [mdn]: https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API
+#[derive(Clone, Debug, JsData, Trace, Finalize)]
+pub struct JsRequest {
+    #[unsafe_ignore_trace]
+    inner: HttpRequest<Option<Vec<u8>>>,
+    signal: Option<JsObject>,
+}
+
+impl JsRequest {
+    /// Get the inner `http::Request` object.
+    pub fn into_inner(mut self) -> HttpRequest<Option<Vec<u8>>> {
+        mem::replace(&mut self.inner, HttpRequest::new(None))
+    }
+
+    /// Split this request into its HTTP request and abort signal.
+    fn into_parts(mut self) -> (HttpRequest<Option<Vec<u8>>>, Option<JsObject>) {
+        let request = mem::replace(&mut self.inner, HttpRequest::new(None));
+        let signal = self.signal.take();
+        (request, signal)
+    }
+
+    /// Get a reference to the inner `http::Request` object.
+    pub fn inner(&self) -> &HttpRequest<Option<Vec<u8>>> {
+        &self.inner
+    }
+
+    /// Get the abort signal associated with this request, if any.
+    pub(crate) fn signal(&self) -> Option<JsObject> {
+        self.signal.clone()
+    }
+
+    /// Get the URI of the request.
+    pub fn uri(&self) -> &http::Uri {
+        self.inner.uri()
+    }
+
+    /// Create a [`JsRequest`] instance from JavaScript arguments, similar to
+    /// calling its constructor in JavaScript.
+    ///
+    /// # Errors
+    /// If the URI is invalid, an error is returned.
+    pub fn create_from_js(
+        input: Either<JsString, JsRequest>,
+        options: Option<RequestInit>,
+    ) -> JsResult<Self> {
+        let (request, signal) = match input {
+            Either::Left(uri) => {
+                let uri = http::Uri::try_from(
+                    uri.to_std_string()
+                        .map_err(|_| js_error!(URIError: "URI cannot have unpaired surrogates"))?,
+                )
+                .map_err(|_| js_error!(URIError: "Invalid URI"))?;
+                let request = http::request::Request::builder()
+                    .uri(uri)
+                    .body(None)
+                    .map_err(|_| js_error!(Error: "Cannot construct request"))?;
+                (request, None)
+            }
+            Either::Right(r) => r.into_parts(),
+        };
+
+        if let Some(mut options) = options {
+            let signal = options.take_signal().or(signal);
+            let inner = options.into_request_builder(Some(request))?;
+            Ok(Self { inner, signal })
+        } else {
+            Ok(Self {
+                inner: request,
+                signal,
+            })
+        }
+    }
+}
+
+impl From<HttpRequest<Option<Vec<u8>>>> for JsRequest {
+    fn from(inner: HttpRequest<Option<Vec<u8>>>) -> Self {
+        Self {
+            inner,
+            signal: None,
+        }
+    }
+}
+
+#[boa_class(rename = "Request")]
+#[boa(rename_all = "camelCase")]
+impl JsRequest {
+    /// # Errors
+    /// Will return an error if the URL or any underlying error occurred in the
+    /// context.
+    #[boa(constructor)]
+    pub fn constructor(
+        input: Either<JsString, JsObject>,
+        options: Option<RequestInit>,
+    ) -> JsResult<Self> {
+        // Need to use a match as `Either::map_right` does not have an equivalent
+        // `Either::map_right_ok`.
+        let input = match input {
+            Either::Right(r) => {
+                if let Ok(request) = r.clone().downcast::<JsRequest>() {
+                    Either::Right(request.borrow().data().clone())
+                } else {
+                    return Err(js_error!(TypeError: "invalid input argument"));
+                }
+            }
+            Either::Left(i) => Either::Left(i),
+        };
+        JsRequest::create_from_js(input, options)
+    }
+
+    #[boa(rename = "clone")]
+    fn clone_request(&self) -> Self {
+        self.clone()
+    }
+
+    /// Returns the HTTP method of the request.
+    ///
+    /// See <https://fetch.spec.whatwg.org/#dom-request-method>
+    #[boa(getter)]
+    fn method(&self) -> JsString {
+        JsString::from(self.inner.method().as_str())
+    }
+
+    /// Returns the URL of the request.
+    ///
+    /// See <https://fetch.spec.whatwg.org/#dom-request-url>
+    #[boa(getter)]
+    fn url(&self) -> JsString {
+        JsString::from(self.inner.uri().to_string().as_str())
+    }
+
+    /// Returns the headers associated with the request.
+    ///
+    /// See <https://fetch.spec.whatwg.org/#dom-request-headers>
+    #[boa(getter)]
+    fn headers(&self) -> JsHeaders {
+        JsHeaders::from_http(self.inner.headers().clone())
+    }
+
+    /// Reads the request body as a UTF-8 string.
+    ///
+    /// Returns a `Promise` that resolves to a string.
+    ///
+    /// See <https://fetch.spec.whatwg.org/#dom-body-text>
+    fn text(&self, context: &mut Context) -> JsPromise {
+        let body = self.inner.body().clone().unwrap_or_default();
+        JsPromise::from_async_fn(
+            async move |_| {
+                let text = String::from_utf8_lossy(&body);
+                Ok(JsString::from(text.as_ref()).into())
+            },
+            context,
+        )
+    }
+
+    /// Reads the request body and parses it as JSON.
+    ///
+    /// Returns a `Promise` that resolves to the parsed JavaScript value.
+    ///
+    /// See <https://fetch.spec.whatwg.org/#dom-body-json>
+    fn json(&self, context: &mut Context) -> JsPromise {
+        let body = self.inner.body().clone().unwrap_or_default();
+        JsPromise::from_async_fn(
+            async move |context| {
+                let json_str = String::from_utf8_lossy(&body);
+                let json = serde_json::from_str::<serde_json::Value>(&json_str)
+                    .map_err(|e| JsNativeError::syntax().with_message(e.to_string()))?;
+                JsValue::from_json(&json, &mut context.borrow_mut())
+            },
+            context,
+        )
+    }
+
+    /// Reads the request body and parses it as `application/x-www-form-urlencoded`.
+    ///
+    /// Returns a `Promise` that resolves to a plain JS object with the form fields.
+    ///
+    /// Note: This is a simplified implementation that only supports
+    /// `application/x-www-form-urlencoded` bodies. Multipart form data is not
+    /// supported. When the same key appears multiple times, the last value wins.
+    ///
+    /// See <https://fetch.spec.whatwg.org/#dom-body-formdata>
+    fn form_data(&self, context: &mut Context) -> JsPromise {
+        let body = self.inner.body().clone().unwrap_or_default();
+        let content_type = self
+            .inner
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        JsPromise::from_async_fn(
+            async move |context| {
+                // Reject multipart; accept url-encoded or no Content-Type.
+                let is_url_encoded = content_type
+                    .as_deref()
+                    .is_none_or(|ct| ct.starts_with("application/x-www-form-urlencoded"));
+
+                if !is_url_encoded {
+                    return Err(JsNativeError::typ()
+                        .with_message(
+                            "formData() only supports application/x-www-form-urlencoded bodies",
+                        )
+                        .into());
+                }
+
+                let ctx = &mut context.borrow_mut();
+                let form_obj = JsObject::default(ctx.intrinsics());
+
+                for (key, value) in url::form_urlencoded::parse(&body) {
+                    form_obj.set(
+                        JsString::from(key.as_ref()),
+                        JsString::from(value.as_ref()),
+                        false,
+                        ctx,
+                    )?;
+                }
+
+                Ok(form_obj.into())
+            },
+            context,
+        )
+    }
+}
